@@ -3,6 +3,56 @@
  * 定期実行トリガーの設定・管理
  */
 
+// ========== 入稿処理トリガー ==========
+
+/**
+ * 毎日指定時刻に入稿フォルダを処理するトリガーを設定する
+ * @param {number} hour - 実行時刻（0〜23）。デフォルト: 8
+ */
+function setupInboxDailyTrigger(hour) {
+  hour = (typeof hour === 'number') ? hour : 8;
+  _deleteTriggersByFunction('processInboxFiles');
+
+  ScriptApp.newTrigger('processInboxFiles')
+    .timeBased()
+    .everyDays(1)
+    .atHour(hour)
+    .create();
+
+  Logger.log('毎日 ' + hour + ':00 (JST) に入稿処理を実行するトリガーを設定しました。');
+}
+
+/**
+ * 指定した間隔（時間）で入稿処理を実行するトリガーを設定する
+ * @param {number} hours - 実行間隔（時間）。1, 2, 4, 6, 8, 12 のいずれか
+ */
+function setupInboxHourlyTrigger(hours) {
+  var validHours = [1, 2, 4, 6, 8, 12];
+  if (!hours || validHours.indexOf(hours) === -1) {
+    Logger.log('有効な時間を指定してください: ' + validHours.join(', '));
+    return;
+  }
+
+  _deleteTriggersByFunction('processInboxFiles');
+
+  ScriptApp.newTrigger('processInboxFiles')
+    .timeBased()
+    .everyHours(hours)
+    .create();
+
+  Logger.log(hours + '時間ごとに入稿処理を実行するトリガーを設定しました。');
+}
+
+/**
+ * 入稿処理トリガーを全て削除する
+ */
+function deleteInboxTriggers() {
+  var deleted = _deleteTriggersByFunction('processInboxFiles');
+  Logger.log('入稿処理トリガーを ' + deleted + ' 件削除しました。');
+}
+
+// ========== 画像アップロードトリガー ==========
+
 /**
  * 毎日深夜2時に uploadAllStoreImages を実行するトリガーを設定する
  * 既存のトリガーがある場合は削除してから再設定する
