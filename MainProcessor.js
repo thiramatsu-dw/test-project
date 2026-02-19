@@ -7,22 +7,26 @@
  *  2. InputProcessor で入稿ファイルをパース
  *  3. 各明細行について:
  *     a. 店舗コードから GBP ロケーションを特定
- *     b. 画像ファイルを Drive から取得
- *     c. ProductsApi で商品ローカルポストを作成
+ *     b. ProductsApi で商品ローカルポストを作成（画像は API 内で一時公開・復元）
  *  4. ExecutionLogger でログシートを出力
  *  5. 入稿ファイルを処理済み / エラーフォルダへ移動
+ *
+ * ★ フォルダ振り分けルール:
+ *    - 1件でも成功 → 処理済みフォルダ
+ *    - 全件失敗（成功0件） → エラーフォルダ
  */
 
-// ===== エントリーポイント（手動 or トリガーから呼ぶ） =====
+// ===== エントリーポイント =====
 
 /**
  * 入稿フォルダ内の全ファイルを処理するメイン関数
+ * トリガーからも手動実行からも呼び出し可能
  */
 function processInboxFiles() {
   Logger.log('=== 入稿処理開始: ' + new Date().toLocaleString('ja-JP') + ' ===');
 
   var folders = _getWorkFolders();
-  var files = _listInboxFiles(folders.inbox);
+  var files   = _listInboxFiles(folders.inbox);
 
   if (files.length === 0) {
     Logger.log('入稿フォルダに処理対象ファイルがありません。');
@@ -37,7 +41,7 @@ function processInboxFiles() {
     try {
       _processOneFile(file, folders);
     } catch (e) {
-      Logger.log('予期せぬエラー: ' + e.message);
+      Logger.log('予期せぬエラーが発生しました: ' + e.message);
       _moveFile(file, folders.error);
     }
 
@@ -49,7 +53,7 @@ function processInboxFiles() {
 }
 
 /**
- * 特定のファイルIDを指定して処理する（テスト・再処理用）
+ * 特定のファイル ID を指定して処理する（再処理・テスト用）
  * @param {string} fileId - 処理する Drive ファイルの ID
  */
 function processFileById(fileId) {
@@ -57,15 +61,118 @@ function processFileById(fileId) {
     Logger.log('使用方法: processFileById("DriveファイルID")');
     return;
   }
-
   var file = DriveApp.getFileById(fileId);
   Logger.log('ファイルを処理します: ' + file.getName());
-
-  var folders = _getWorkFolders();
-  _processOneFile(file, folders);
+  _processOneFile(file, _getWorkFolders());
 }
 
 // ===== 内部処理 =====
+
+/**
+ * 1ファイルの入稿処理を行う
+ * @returns {{ successCount: number, errorCount: number }}
+ */
+function _processOneFile(file, folders) {
+  var fileName = file.getName();
+
+  // ====== 1. ファイルのパース ======
+  var parsed = InputProcessor.parse(file);
+  var logger = ExecutionLogger.create(folders.results, fileName);
+
+  // ヘッダーレベルのエラー処理
+  if (parsed.errors.length > 0) {
+    parsed.errors.forEach(function(err) {
+      Logger.log('  入稿エラー: ' + err);
+      logger.addHeaderError(err, fileName);
+    });
+
+    if (!parsed.header) {
+      // ヘッダーが読めない致命的エラー → ログ確定後にエラーフォルダへ
+      logger.finalize();
+      _moveFile(file, folders.error);
+      return { successCount: 0, errorCount: 1 };
+    }
+  }
+
+  var header = parsed.header;
+  Logger.log('  グループ: ' + header.businessGroupName +
+             ' | アカウントID: ' + header.googleAccountId);
+
+  var accountName = _normalizeAccountName(header.googleAccountId);
+
+  // ====== 2. 店舗コードマップの取得 ======
+  var storeCodeMap = {};
+  try {
+    storeCodeMap = ProductsApi.buildStoreCodeMap(accountName);
+  } catch (e) {
+    var mapErrMsg = 'GBP ロケーション一覧の取得に失敗しました: ' + e.message;
+    Logger.log('  ' + mapErrMsg);
+    logger.addHeaderError(mapErrMsg, fileName);
+    logger.finalize();
+    _moveFile(file, folders.error);
+    return { successCount: 0, errorCount: 1 };
+  }
+
+  // 画像ルートフォルダ ID の解決
+  var imageRootFolderId = _resolveImageRootFolderId(folders.inbox);
+
+  // ====== 3. 明細行の処理 ======
+  var successCount = 0;
+  var errorCount   = 0;
+
+  parsed.details.forEach(function(item) {
+    var detail = item.data;
+    Logger.log('  行' + item.rowNum + ': ' + detail.businessName + ' / ' + detail.productName);
+
+    // バリデーションエラー
+    if (item.errors.length > 0) {
+      var valErrMsg = item.errors.join(' / ');
+      Logger.log('    バリデーションエラー: ' + valErrMsg);
+      logger.addRow(header, detail, 'ERROR', '', valErrMsg, fileName);
+      errorCount++;
+      return;
+    }
+
+    // 店舗コードからロケーションを特定
+    var locationName = ProductsApi.findLocationName(accountName, detail.storeCode, storeCodeMap);
+    if (!locationName) {
+      var notFoundMsg = '店舗コード「' + detail.storeCode + '」に対応する GBP ロケーションが見つかりません' +
+                        '（GBP 管理画面で storeCode が設定されているか確認してください）';
+      Logger.log('    ' + notFoundMsg);
+      logger.addRow(header, detail, 'ERROR', '', notFoundMsg, fileName);
+      errorCount++;
+      return;
+    }
+
+    // GBP に商品を登録
+    try {
+      var result  = ProductsApi.createProduct(accountName, locationName, detail, imageRootFolderId);
+      var postId  = result.name || '';
+      Logger.log('    登録成功: ' + postId);
+      logger.addRow(header, detail, 'SUCCESS', postId, '', fileName);
+      successCount++;
+    } catch (e) {
+      Logger.log('    登録失敗: ' + e.message);
+      logger.addRow(header, detail, 'ERROR', '', e.message, fileName);
+      errorCount++;
+    }
+
+    // 明細間インターバル（API レートリミット対策）
+    Utilities.sleep(300);
+  });
+
+  // ====== 4. ログ確定・ファイル振り分け ======
+  logger.finalize();
+  Logger.log('  実行ログ URL: ' + logger.getSpreadsheetUrl());
+  Logger.log('  結果: 成功 ' + successCount + ' 件, 失敗 ' + errorCount + ' 件');
+
+  // ★ 1件でも成功があれば処理済み、全件失敗ならエラーフォルダへ
+  _moveFile(file, successCount > 0 ? folders.processed : folders.error);
+
+  return { successCount: successCount, errorCount: errorCount };
+}
+
+// ===== ユーティリティ =====
 
 /**
  * 作業用フォルダ（入稿・処理済み・エラー・処理結果）を取得または作成する
@@ -76,9 +183,9 @@ function _getWorkFolders() {
   if (CONFIG.INBOX_FOLDER_ID) {
     inbox = DriveApp.getFolderById(CONFIG.INBOX_FOLDER_ID);
   } else {
-    var rootFolders = DriveApp.getRootFolder().getFoldersByName(CONFIG.INBOX_FOLDER_NAME);
-    inbox = rootFolders.hasNext()
-      ? rootFolders.next()
+    var rootIt = DriveApp.getRootFolder().getFoldersByName(CONFIG.INBOX_FOLDER_NAME);
+    inbox = rootIt.hasNext()
+      ? rootIt.next()
       : DriveApp.getRootFolder().createFolder(CONFIG.INBOX_FOLDER_NAME);
   }
 
@@ -91,22 +198,19 @@ function _getWorkFolders() {
 }
 
 /**
- * 入稿フォルダ内の処理対象ファイル一覧を返す
- * （処理済み・エラー・処理結果 サブフォルダを除く）
+ * 入稿フォルダ内の処理対象ファイル（Sheets / Excel / CSV）を返す
+ *
+ * DriveApp.Folder.getFiles() は直接の子ファイルのみ返すため、
+ * サブフォルダ（処理済み・エラー等）内のファイルは自動的に除外される。
  */
 function _listInboxFiles(inboxFolder) {
-  var skip = [
-    CONFIG.PROCESSED_FOLDER_NAME,
-    CONFIG.ERROR_FOLDER_NAME,
-    CONFIG.RESULTS_FOLDER_NAME
-  ];
   var files = [];
-  var it = inboxFolder.getFiles();
+  var it    = inboxFolder.getFiles();
 
   while (it.hasNext()) {
-    var f = it.next();
+    var f    = it.next();
     var mime = f.getMimeType();
-    // スプレッドシート・Excel・CSV のみ対象
+
     if (
       mime === MimeType.GOOGLE_SHEETS ||
       mime === 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' ||
@@ -121,230 +225,128 @@ function _listInboxFiles(inboxFolder) {
 }
 
 /**
- * 1ファイルの入稿処理を行う
- */
-function _processOneFile(file, folders) {
-  var fileName = file.getName();
-
-  // ====== 1. ファイルのパース ======
-  var parsed = InputProcessor.parse(file);
-  var logger = ExecutionLogger.create(folders.results, fileName);
-  var hasAnyError = false;
-
-  // ヘッダーレベルのエラーがある場合
-  if (parsed.errors.length > 0) {
-    parsed.errors.forEach(function(err) {
-      Logger.log('入稿ヘッダーエラー: ' + err);
-      logger.addHeaderError(err, fileName);
-    });
-
-    if (!parsed.header) {
-      // ヘッダーが読めない致命的エラー
-      logger.finalize();
-      _moveFile(file, folders.error);
-      Logger.log('ヘッダーが読み取れないためスキップしました: ' + fileName);
-      return;
-    }
-    hasAnyError = true;
-  }
-
-  var header = parsed.header;
-  Logger.log('ヘッダー情報 | グループ: ' + header.businessGroupName +
-    ' | アカウントID: ' + header.googleAccountId);
-
-  // GBP アカウント名を組み立てる
-  // googleAccountId が "accounts/XXXXX" 形式の場合はそのまま、数字のみの場合は prefix を付ける
-  var accountName = _normalizeAccountName(header.googleAccountId);
-
-  // ====== 2. 店舗コードマップの取得 ======
-  var storeCodeMap = {};
-  try {
-    storeCodeMap = ProductsApi.buildStoreCodeMap(accountName);
-    Logger.log('ロケーション取得完了: ' + Object.keys(storeCodeMap).length + ' 件');
-  } catch (e) {
-    var errMsg = 'GBP ロケーション取得エラー: ' + e.message;
-    Logger.log(errMsg);
-    logger.addHeaderError(errMsg, fileName);
-    logger.finalize();
-    _moveFile(file, folders.error);
-    return;
-  }
-
-  // 画像ルートフォルダIDの解決
-  var imageRootFolderId = _resolveImageRootFolderId();
-
-  // ====== 3. 明細行の処理 ======
-  parsed.details.forEach(function(item) {
-    var detail = item.data;
-    var rowNum  = item.rowNum;
-
-    Logger.log('  行' + rowNum + ': ' + detail.businessName + ' / ' + detail.productName);
-
-    // 行レベルのバリデーションエラー
-    if (item.errors.length > 0) {
-      var errMsg = item.errors.join(' / ');
-      Logger.log('    バリデーションエラー: ' + errMsg);
-      logger.addRow(header, detail, 'ERROR', '', errMsg, fileName);
-      hasAnyError = true;
-      return;
-    }
-
-    // 店舗コードからロケーションを特定
-    var locationName = ProductsApi.findLocationName(accountName, detail.storeCode, storeCodeMap);
-    if (!locationName) {
-      var msg = '店舗コード「' + detail.storeCode + '」に対応するGBPロケーションが見つかりません';
-      Logger.log('    ' + msg);
-      logger.addRow(header, detail, 'ERROR', '', msg, fileName);
-      hasAnyError = true;
-      return;
-    }
-
-    // GBP に商品を登録
-    try {
-      var result = ProductsApi.createProduct(
-        accountName,
-        locationName,
-        detail,
-        imageRootFolderId
-      );
-
-      var postId = result.name || '';
-      Logger.log('    登録成功: ' + postId);
-      logger.addRow(header, detail, 'SUCCESS', postId, '', fileName);
-
-    } catch (e) {
-      Logger.log('    登録失敗: ' + e.message);
-      logger.addRow(header, detail, 'ERROR', '', e.message, fileName);
-      hasAnyError = true;
-    }
-
-    // 明細間のインターバル
-    Utilities.sleep(300);
-  });
-
-  // ====== 4. ログの確定 & ファイル移動 ======
-  logger.finalize();
-  Logger.log('実行ログURL: ' + logger.getSpreadsheetUrl());
-
-  if (hasAnyError) {
-    // エラーありでも部分成功の場合は処理済みフォルダへ
-    // （全件エラーの場合はエラーフォルダ）
-    var details = parsed.details || [];
-    var allError = details.length > 0 && details.every(function(item) {
-      return item.errors.length > 0;
-    });
-
-    _moveFile(file, allError ? folders.error : folders.processed);
-  } else {
-    _moveFile(file, folders.processed);
-  }
-}
-
-// ===== ユーティリティ =====
-
-/**
  * アカウント名を "accounts/XXXXXX" 形式に正規化する
+ * @param {string} googleAccountId - "accounts/123" または "123" 形式
  */
 function _normalizeAccountName(googleAccountId) {
   if (!googleAccountId) return '';
   var s = googleAccountId.trim();
-  if (s.startsWith('accounts/')) return s;
-  return 'accounts/' + s;
+  return s.startsWith('accounts/') ? s : 'accounts/' + s;
 }
 
 /**
- * 画像ルートフォルダIDを設定またはフォルダ名から解決する
+ * 入稿フォルダ内の「商品画像」フォルダ ID を返す
+ * 見つからない場合は null（imagePath をファイル ID / Drive URL として解釈）
+ * @param {Folder} inboxFolder
  */
-function _resolveImageRootFolderId() {
-  // 入稿フォルダ内に「商品画像」フォルダが存在すればそのIDを使用
+function _resolveImageRootFolderId(inboxFolder) {
   try {
-    var inboxFolder = CONFIG.INBOX_FOLDER_ID
-      ? DriveApp.getFolderById(CONFIG.INBOX_FOLDER_ID)
-      : DriveApp.getRootFolder();
-
     var it = inboxFolder.getFoldersByName(CONFIG.IMAGE_ROOT_FOLDER_NAME);
     if (it.hasNext()) return it.next().getId();
   } catch (e) {}
-
-  return null; // 見つからない場合は null（imagePath をファイルIDとして解釈）
+  return null;
 }
 
-/**
- * ファイルを指定フォルダへ移動する
- */
+/** ファイルを指定フォルダへ移動する */
 function _moveFile(file, targetFolder) {
   try {
     file.moveTo(targetFolder);
   } catch (e) {
-    Logger.log('ファイル移動に失敗しました (' + file.getName() + '): ' + e.message);
+    Logger.log('ファイルの移動に失敗しました (' + file.getName() + '): ' + e.message);
   }
 }
 
-/**
- * 親フォルダ内にサブフォルダを取得、なければ作成する
- */
+/** 親フォルダ内のサブフォルダを取得、なければ作成する */
 function _getOrCreateSubFolder(parentFolder, name) {
   var it = parentFolder.getFoldersByName(name);
   return it.hasNext() ? it.next() : parentFolder.createFolder(name);
 }
 
-// ===== 入稿テンプレート作成ユーティリティ =====
+// ===== テンプレート作成ユーティリティ =====
 
 /**
  * 入稿用テンプレートスプレッドシートを入稿フォルダに作成する
- * 初回セットアップ時に実行
+ * 初回セットアップ時に実行してください
  */
 function createInputTemplate() {
   var folders = _getWorkFolders();
-  var ss = SpreadsheetApp.create('入稿テンプレート_商品登録');
-  var sheet = ss.getActiveSheet();
+  var ss      = SpreadsheetApp.create('入稿テンプレート_商品登録');
+  var sheet   = ss.getActiveSheet();
   sheet.setName('入稿シート');
 
-  // ヘッダー部
-  var headerData = [
-    ['ビジネスグループID', '（ここに値を入力）', '', '', '', '', '', '', ''],
-    ['ビジネスグループ名', '（ここに値を入力）', '', '', '', '', '', '', ''],
-    ['GoogleアカウントID', 'accounts/XXXXXX', '', '', '', '', '', '', ''],
-    ['PASS',              '（ここに値を入力）', '', '', '', '', '', '', ''],
-    [],  // 空行
-    // 明細ヘッダー
-    ['ビジネス名', '店舗コード', '商品カテゴリ', '商品・サービス名', '商品の説明', '商品価格', 'ボタン追加', '商品のランディングページURL', '画像ファイルパス']
+  // ===== ヘッダー部（行1〜5）=====
+  var headerSection = [
+    ['ビジネスグループID', '',             '', '', '', '', '', '', ''],
+    ['ビジネスグループ名', '',             '', '', '', '', '', '', ''],
+    ['GoogleアカウントID', 'accounts/',    '', '', '', '', '', '', ''],
+    ['PASS',              '',             '', '', '', '', '', '', ''],
+    []   // 空行
   ];
+  sheet.getRange(1, 1, headerSection.length, 9).setValues(headerSection);
 
-  sheet.getRange(1, 1, headerData.length, 9).setValues(headerData);
+  // ヘッダーキー列のスタイル
+  sheet.getRange(1, 1, 4, 1)
+    .setFontWeight('bold')
+    .setBackground('#e8f0fe');
+  // ヘッダー値列のガイドスタイル
+  sheet.getRange(1, 2, 4, 1)
+    .setBackground('#f8f9fa')
+    .setFontColor('#5f6368')
+    .setFontStyle('italic');
 
-  // スタイル: ヘッダーキー列
-  sheet.getRange(1, 1, 4, 1).setFontWeight('bold').setBackground('#e8f0fe');
-  // スタイル: 明細ヘッダー行（6行目）
-  var detailHeaderRange = sheet.getRange(6, 1, 1, 9);
-  detailHeaderRange.setBackground('#4a86e8').setFontColor('#ffffff').setFontWeight('bold');
+  // ===== 明細ヘッダー行（行6）=====
+  var colNames = Object.keys(CONFIG.INPUT_DETAIL_COLS);
+  sheet.getRange(6, 1, 1, colNames.length).setValues([colNames]);
+  sheet.getRange(6, 1, 1, colNames.length)
+    .setBackground('#4a86e8')
+    .setFontColor('#ffffff')
+    .setFontWeight('bold');
   sheet.setFrozenRows(6);
 
-  // サンプル明細（7行目）
-  var sampleData = [
-    ['渋谷店', 'SHOP-001', '食品・飲料', 'おすすめランチセット',
-     '当店自慢のランチセットです。11:00〜14:00限定。', 1200,
-     '詳細', 'https://example.com/lunch', '商品画像/渋谷店/lunch.jpg']
+  // ===== サンプルデータ（行7）=====
+  var sample = [
+    '渋谷店',         // ビジネス名
+    'SHOP-001',       // 店舗コード（GBP の storeCode と一致させること）
+    '食品・飲料',      // 商品カテゴリ
+    'おすすめランチセット', // 商品・サービス名
+    '当店自慢のランチセット。11:00〜14:00限定。旬の食材を使った日替わりメニューです。', // 商品の説明
+    1200,             // 商品価格
+    '詳細',           // ボタン追加
+    'https://example.com/lunch', // ランディングページURL
+    '商品画像/渋谷店/lunch.jpg'  // 画像ファイルパス（Driveパス または ファイルID）
   ];
-  sheet.getRange(7, 1, 1, 9).setValues(sampleData);
-  sheet.getRange(7, 1, 1, 9).setBackground('#fff9c4');
+  sheet.getRange(7, 1, 1, sample.length).setValues([sample]);
+  sheet.getRange(7, 1, 1, sample.length).setBackground('#fff9c4');
 
-  // 列幅の調整
-  [150, 120, 130, 200, 250, 80, 100, 250, 250].forEach(function(w, i) {
-    sheet.setColumnWidth(i + 1, w);
-  });
+  // ===== 列幅 =====
+  var colWidths = [120, 110, 120, 200, 300, 80, 90, 250, 250];
+  colWidths.forEach(function(w, i) { sheet.setColumnWidth(i + 1, w); });
+  sheet.setRowHeight(7, 21);
 
-  // ボタン追加のドロップダウン
-  var buttonOptions = Object.keys(CONFIG.BUTTON_TYPE_MAP);
-  var rule = SpreadsheetApp.newDataValidation()
-    .requireValueInList(buttonOptions, true).build();
-  sheet.getRange(7, 7, 100, 1).setDataValidation(rule);
+  // ===== ボタン追加のドロップダウン（8行目以降に適用）=====
+  var btnOptions = Object.keys(CONFIG.BUTTON_TYPE_MAP);
+  var btnRule    = SpreadsheetApp.newDataValidation()
+    .requireValueInList(btnOptions, true)
+    .setAllowInvalid(false)
+    .build();
+  sheet.getRange(7, 7, 1000, 1).setDataValidation(btnRule);
 
-  // Drive フォルダへ移動
+  // ===== ガイドメモ =====
+  var noteRange = sheet.getRange(1, 4);
+  noteRange.setNote(
+    '【使い方】\n' +
+    '1. 1〜4行目のB列に各値を入力してください\n' +
+    '2. 7行目以降に商品情報を入力してください（サンプルを参考に）\n' +
+    '3. 画像ファイルパスは Driveパス（例: 商品画像/店舗名/image.jpg）\n' +
+    '   または Drive ファイル ID を入力してください\n' +
+    '4. 入稿フォルダにこのファイルを保存して processInboxFiles() を実行してください'
+  );
+
+  // ===== Drive 入稿フォルダへ移動 =====
   var file = DriveApp.getFileById(ss.getId());
   folders.inbox.addFile(file);
-  DriveApp.getRootFolder().removeFile(file);
+  try { DriveApp.getRootFolder().removeFile(file); } catch (e) {}
 
   Logger.log('入稿テンプレートを作成しました: ' + ss.getUrl());
-  Logger.log('入稿フォルダに保存されました。このファイルを複製して入稿に使用してください。');
+  Logger.log('入稿フォルダ: ' + folders.inbox.getUrl());
 }
